@@ -1,3 +1,4 @@
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import pandas as pd
@@ -27,7 +28,7 @@ def get_klines(symbol, interval, limit=100):
     df["volume"] = df["volume"].astype(float)
     return df
 
-# === Analyze with Indicators and Volume ===
+# === Analyze with Indicators + Volume ===
 def analyze_chart(symbol, interval):
     df = get_klines(symbol, interval)
     df["rsi"] = ta.rsi(df["close"], length=14)
@@ -35,6 +36,7 @@ def analyze_chart(symbol, interval):
     df["macd_hist"] = macd["MACDh_12_26_9"]
     df["ema_50"] = ta.ema(df["close"], length=50)
     df["ema_200"] = ta.ema(df["close"], length=200)
+    df["vol_ma_20"] = df["volume"].rolling(20).mean()
 
     rsi = df["rsi"].iloc[-1]
     macd_hist = df["macd_hist"].iloc[-1]
@@ -42,7 +44,7 @@ def analyze_chart(symbol, interval):
     ema_200 = df["ema_200"].iloc[-1]
     price = df["close"].iloc[-1]
     volume = df["volume"].iloc[-1]
-    avg_volume = df["volume"].rolling(window=20).mean().iloc[-1]
+    avg_volume = df["vol_ma_20"].iloc[-1]
     volume_spike = volume > avg_volume * 1.5
 
     signals = []
@@ -78,13 +80,13 @@ def analyze_chart(symbol, interval):
         "macd_hist": macd_hist,
         "ema_50": ema_50,
         "ema_200": ema_200,
+        "volume": volume,
+        "avg_volume": avg_volume,
+        "volume_spike": volume_spike,
         "direction": direction,
         "stop_loss": sl,
         "take_profit": tp,
-        "confidence": confidence,
-        "volume": volume,
-        "avg_volume": avg_volume,
-        "volume_spike": volume_spike
+        "confidence": confidence
     }
 
 # === News Fetcher with Sentiment ===
@@ -93,25 +95,23 @@ def get_crypto_news():
         url = "https://newsdata.io/api/1/news?apikey=pub_7723401795bf14c215172c19a55b87204588a&category=business,technology&language=en&q=crypto"
         response = requests.get(url)
         data = response.json()
-        articles = data.get("results", [])[:3]
-        results = []
-        for item in articles:
-            title = item['title']
-            sentiment = "🟡 Neutral"
-            if any(word in title.lower() for word in ["surge", "rise", "gain", "soars", "bullish"]):
-                sentiment = "🟢 Bullish"
-            elif any(word in title.lower() for word in ["fall", "drop", "bearish", "crash", "dip"]):
-                sentiment = "🔴 Bearish"
-            results.append(f"- {title} ({sentiment})")
-        return results
+        results = data.get("results", [])[:3]
+        news = []
+        for item in results:
+            title = item["title"]
+            source = item["source_id"]
+            sentiment = "🟢 Bullish" if any(word in title.lower() for word in ["surge", "rise", "gain", "pump"]) else                         "🔴 Bearish" if any(word in title.lower() for word in ["fall", "drop", "crash", "plunge"]) else "🟡 Neutral"
+            news.append({"title": title, "source": source, "sentiment": sentiment})
+        return news
     except:
         return []
 
-# === Send Alert ===
+# === Send formatted alert ===
 async def send_alert(application, analysis, news_list=None):
     if analysis["direction"] in ["📈 LONG", "📉 SHORT"]:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        tv_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{analysis['symbol']}"
+        symbol = analysis['symbol'].replace('USDT', '')
+        chart_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}USDT"
         text = f"""
 📡 Auto Signal: {analysis['symbol']} ({analysis['interval']})
 Signal: {analysis['direction']}
@@ -119,23 +119,26 @@ Confidence: {analysis['confidence']}%
 Price: {analysis['price']}
 RSI: {analysis['rsi']:.2f} | MACD: {analysis['macd_hist']:.5f}
 EMA 50: {analysis['ema_50']:.2f} | EMA 200: {analysis['ema_200']:.2f}
-📊 Volume: {analysis['volume']:.0f} | Avg: {analysis['avg_volume']:.0f}
-{"🔥 Volume Spike Detected!" if analysis['volume_spike'] else ""}
-Entry: {analysis['price']}
-SL: {analysis['stop_loss']} | TP: {analysis['take_profit']}
-📈 Chart: {tv_link}
-⏰ Time: {now}
-"""
+📊 Volume: {analysis['volume']} | Avg: {analysis['avg_volume']:.2f}
+{ '🔥 Volume Spike Detected!' if analysis['volume_spike'] else '' }
+Entry: {analysis['price']} | SL: {analysis['stop_loss']} | TP: {analysis['take_profit']}
+📈 Chart: {chart_link}
+🕒 Time: {now}
+        """
         if news_list:
-            text += "\n📰 Top News with Sentiment:\n"
-            text += "\n".join(news_list)
+            text += "
+📰 Top News with Sentiment:
+"
+            for item in news_list:
+                text += f"- {item['title']} ({item['sentiment']}, {item['source']})
+"
 
         await application.bot.send_message(chat_id=application.bot_data['chat_id'], text=text)
 
-# === Commands ===
+# === Telegram Commands ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.application.bot_data['chat_id'] = update.effective_chat.id
-    await update.message.reply_text("👋 Send /analyze BTCUSDT 15m to get a trading prediction!")
+    await update.message.reply_text("👋 Welcome! Use /analyze BTCUSDT 15m")
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -145,9 +148,10 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         news = get_crypto_news()
         await send_alert(context.application, analysis, news)
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {str(e)}\nUse: /analyze BTCUSDT 15m")
+        await update.message.reply_text(f"⚠️ Error: {str(e)}
+Try: /analyze BTCUSDT 15m")
 
-# === Background Auto Scanner ===
+# === Background Auto Scan ===
 async def auto_scan(application):
     news = get_crypto_news()
     for symbol in COINS:
@@ -155,7 +159,7 @@ async def auto_scan(application):
         if analysis['confidence'] >= 67 and analysis['direction'] != "😐 NO CLEAR SIGNAL":
             await send_alert(application, analysis, news)
 
-# === Run the Bot ===
+# === Run Bot ===
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("analyze", analyze))
@@ -164,5 +168,5 @@ scheduler = AsyncIOScheduler()
 scheduler.add_job(auto_scan, 'interval', minutes=10, args=[app])
 scheduler.start()
 
-print("🚀 Bot is running.. Waiting for commands on Telegram")
+print("🚀 Bot is running and sending alerts...")
 app.run_polling()
